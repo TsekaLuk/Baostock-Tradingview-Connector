@@ -325,6 +325,7 @@ probe 返回 `capabilities.liveBars: true`。返回 `text/event-stream`，每条
 | `barAggregation` | `original`（默认）/ `aligned` / `europe-traditional`；TradingView 只有原生边界 |
 | `adjustment` | 可选，`splits`（默认）/ `qfq` / `none` |
 | `exchange` | 可选，显式交易所 |
+| `instrumentId` | 可选，`instruments/search` 返回的品种 id（`tradingview:<EXCHANGE\|auto>:<symbol>`）；优先级 instrumentId > exchange > 裸 symbol，与 `/bars` 解析出同一交易所 |
 
 同一序列的所有连接共享一个上游轮询（默认 5 秒，休市或出错时降频），断开即退订，最后一个订阅者离开时停止轮询。环境变量：`LIVE_BARS_POLL_INTERVAL_S`、`LIVE_BARS_IDLE_INTERVAL_S`、`LIVE_BARS_SNAPSHOT_SIZE`、`LIVE_BARS_MAX_FEEDS`（默认 32）、`LIVE_BARS_MAX_SUBSCRIBERS_PER_FEED`（默认 200）；超限返回 503。
 

@@ -283,7 +283,10 @@ class _FakeRequest:
 
 class StreamRouteTest(unittest.IsolatedAsyncioTestCase):
     async def _call(self, source_id="tradingview", **params):
-        values = {"symbol": "AAPL", "period": "5min", "bar_aggregation": "original", "adjustment": "splits", "exchange": ""}
+        values = {
+            "symbol": "AAPL", "period": "5min", "bar_aggregation": "original",
+            "adjustment": "splits", "exchange": "", "instrument_id": "",
+        }
         values.update(params)
         return await market_data_v1.stream_live_bars(_FakeRequest(), source_id=source_id, **values)
 
@@ -300,6 +303,8 @@ class StreamRouteTest(unittest.IsolatedAsyncioTestCase):
             ({"period": "2min"}, "INVALID_REQUEST"),
             ({"bar_aggregation": "weird"}, "INVALID_REQUEST"),
             ({"adjustment": "hfq"}, "INVALID_REQUEST"),
+            ({"instrument_id": "gotdx:stock:sh:600000"}, "INVALID_REQUEST"),
+            ({"instrument_id": "tradingview:NASDAQ"}, "INVALID_REQUEST"),
         ]
         for params, code in cases:
             response = await self._call(**params)
@@ -327,6 +332,59 @@ class StreamRouteTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["type"], "snapshot")
             self.assertEqual(snapshot["symbol"], "nasdaq:AAPL")
             await body.aclose()
+        self.assertEqual(hub.feeds, {})
+
+    def _recording_hub(self, keys: list):
+        def factory(key, period):
+            keys.append(key)
+            fetcher = _ScriptedFetcher([[_bar(T0, 1)]])
+            return fetcher, fetcher.close
+
+        return LiveBarsHub(factory, poll_interval=0.01, idle_interval=0.01, snapshot_size=10, clock=lambda: T0 / 1000)
+
+    async def test_instrument_id_matches_search_and_bars_resolution(self):
+        """instrumentId 用 _tv_instrument 的 id 格式，解析出的交易所与 /bars 一致。"""
+        for exchange, expected in [("NASDAQ", ("NASDAQ", "AAPL")), ("", ("", "AAPL"))]:
+            instrument = market_data_v1._tv_instrument("AAPL", exchange)
+            self.assertEqual(market_data_v1._tv_ref_from_instrument_id(instrument["id"]), expected)
+            source = unittest.mock.MagicMock()
+            source.latest_snapshot.return_value = []
+            request = market_data_v1.BarRequest.model_validate({
+                "sourceId": "tradingview",
+                "instrument": {k: instrument[k] for k in ("id", "symbol", "exchange", "providerRef")},
+                "period": "5min", "adjustment": "splits", "limit": 2,
+            })
+            with patch("api.market_data_v1.TradingViewSource", return_value=source):
+                market_data_v1._fetch_tradingview_bars(request)
+            bars_exchange = source.set_exchange.call_args.args[0]
+            self.assertEqual("" if bars_exchange.upper() in ("", "AUTO") else bars_exchange, expected[0])
+
+    async def test_instrument_id_takes_precedence_over_exchange_and_symbol(self):
+        keys = []
+        hub = self._recording_hub(keys)
+        with patch.object(market_data_v1, "live_bars_hub", hub):
+            response = await self._call(symbol="AAPL", exchange="CAPITALCOM", instrument_id="tradingview:NASDAQ:AAPL")
+            await response.body_iterator.aclose()
+            response = await self._call(symbol="AAPL", exchange="CAPITALCOM")
+            await response.body_iterator.aclose()
+        self.assertEqual(keys, [("NASDAQ", "AAPL", "5min", "splits"), ("CAPITALCOM", "AAPL", "5min", "splits")])
+        hub.close()
+
+    async def test_same_symbol_different_instrument_ids_get_separate_pollers(self):
+        keys = []
+        hub = self._recording_hub(keys)
+        with patch.object(market_data_v1, "live_bars_hub", hub):
+            nasdaq = await self._call(symbol="AAPL", instrument_id="tradingview:NASDAQ:AAPL")
+            auto = await self._call(symbol="AAPL", instrument_id="tradingview:auto:AAPL")
+            nasdaq_again = await self._call(symbol="AAPL", instrument_id="tradingview:NASDAQ:AAPL")
+            self.assertEqual(len(hub.feeds), 2)
+            self.assertEqual(keys, [("NASDAQ", "AAPL", "5min", "splits"), ("", "AAPL", "5min", "splits")])
+            for response in (nasdaq, auto, nasdaq_again):
+                body = response.body_iterator
+                await body.__anext__()
+                frame = json.loads((await body.__anext__())[len("data: "):])
+                self.assertEqual((frame["type"], frame["symbol"]), ("snapshot", "AAPL"))
+                await body.aclose()
         self.assertEqual(hub.feeds, {})
 
     async def test_capacity_error_returns_503(self):

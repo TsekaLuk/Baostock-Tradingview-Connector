@@ -723,6 +723,19 @@ def _tv_feed_factory(key: tuple, period: str):
 live_bars_hub = LiveBarsHub(_tv_feed_factory, clock=_tv_bar_clock)
 
 
+def _tv_ref_from_instrument_id(instrument_id: str) -> tuple[str, str] | None:
+    """解析 _tv_instrument 生成的 ``tradingview:{EXCHANGE|auto}:{symbol}``。
+
+    与 _fetch_tradingview_bars 的解析口径一致：交易所段为 ``auto`` 时走同样的自动探测，
+    否则固定该交易所，保证实时流与 /bars 命中同一品种。格式不符返回 None。
+    """
+    parts = instrument_id.strip().split(":", 2)
+    if len(parts) != 3 or parts[0] != "tradingview" or not parts[2].strip():
+        return None
+    exchange = parts[1].strip().upper()
+    return ("" if exchange == "AUTO" else exchange), parts[2].strip()
+
+
 def _split_tv_symbol(symbol: str, exchange: str) -> tuple[str, str]:
     """支持 ``EXCHANGE:SYMBOL`` 写法；显式 exchange 参数优先。"""
     sym = symbol.strip()
@@ -743,6 +756,7 @@ async def stream_live_bars(
     bar_aggregation: str = Query(_ORIGINAL_BAR_AGGREGATION, alias="barAggregation"),
     adjustment: str = Query("splits"),
     exchange: str = Query("", max_length=32),
+    instrument_id: str = Query("", alias="instrumentId", max_length=256),
 ):
     """实时 K 线 SSE：snapshot → forming/closed 增量 → status；同序列共享一个上游轮询。"""
     error = _source_error(source_id)
@@ -759,7 +773,16 @@ async def stream_live_bars(
     if adjustment not in _TV_ADJUST_TO_TF:
         return _failure(400, "INVALID_REQUEST", f"adjustment must be one of {sorted(_TV_ADJUST_TO_TF)}")
 
-    tv_exchange, tv_symbol = _split_tv_symbol(symbol, exchange)
+    # 优先级：instrumentId > 显式 exchange（或 EXCHANGE:SYMBOL）> 裸 symbol 自动探测
+    if instrument_id.strip():
+        ref = _tv_ref_from_instrument_id(instrument_id)
+        if ref is None:
+            return _failure(
+                400, "INVALID_REQUEST", "instrumentId must look like tradingview:<EXCHANGE|auto>:<symbol>"
+            )
+        tv_exchange, tv_symbol = ref
+    else:
+        tv_exchange, tv_symbol = _split_tv_symbol(symbol, exchange)
     # TradingView 只提供原生边界，barAggregation 不影响上游数据，故不进入序列键
     key = (tv_exchange, tv_symbol.upper(), period, _TV_ADJUST_TO_TF[adjustment])
     try:
